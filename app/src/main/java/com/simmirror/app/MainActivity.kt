@@ -503,9 +503,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ================= 2. الربط السحابي عبر الإنترنت (Cloud WebSocket Bridge) =================
+    private fun     // ================= تحديث الربط السحابي الثابت (Auto-Reconnect Cloud Bridge) =================
+    private var isCloudConnected = false
+
     private fun connectCloudBridge() {
         val client = OkHttpClient.Builder()
-            .pingInterval(20, TimeUnit.SECONDS)
+            .pingInterval(10, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .build()
 
         val roomEncoded = Uri.encode(MirrorBridge.secretRoomCode)
@@ -513,14 +517,15 @@ class MainActivity : AppCompatActivity() {
             .url("wss://free.blr2.piesocket.com/v3/$roomEncoded?api_key=VCXCEuvhGcBDP7XhiJJUDvR1e1D3eiVjgZ9VRiaV&notify_self=0")
             .build()
 
-        appendLog("☁️ جاري الاتصال بالسحابة على الغرفة [${MirrorBridge.secretRoomCode}]...")
+        appendLog("☁️ جاري الاتصال بالسحابة الثابتة على الغرفة [${MirrorBridge.secretRoomCode}]...")
 
-        val ws = client.newWebSocket(request, object : WebSocketListener() {
+        client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 MirrorBridge.attachCloudSocket(webSocket)
+                isCloudConnected = true
                 scope.launch {
-                    topStatusBanner.text = "☁️ متصل سحابياً | الغرفة: ${MirrorBridge.secretRoomCode}"
-                    appendLog("✅ تم الربط السحابي بنجاح! الهاتفان متصلان عبر الإنترنت من أي مكان.")
+                    topStatusBanner.text = "☁️ متصل سحابياً بثبات | الغرفة: ${MirrorBridge.secretRoomCode}"
+                    appendLog("✅ تم الربط السحابي بنجاح وثبات تام!")
                     if (MirrorBridge.isHostMode) sendBatteryStatusToClient()
                 }
             }
@@ -538,10 +543,23 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                scope.launch { appendLog("⚠️ تنبيه سحابي: تأكد من اتصال الإنترنت (${t.localizedMessage})") }
+                isCloudConnected = false
+                scope.launch { 
+                    appendLog("⚠️ انقطع الاتصال السحابي، جاري إعادة المحاولة خلال 5 ثوانٍ...")
+                }
+                // إعادة المحاولة تلقائياً بعد 5 ثوانٍ لضمان عدم انقطاع الخدمة أبداً
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (!isCloudConnected) connectCloudBridge()
+                }, 5000)
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                isCloudConnected = false
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (!isCloudConnected) connectCloudBridge()
+                }, 5000)
             }
         })
-        MirrorBridge.attachCloudSocket(ws)
     }
 
     // ================= 3. معالجة الأوامر والمميزات الـ 6 =================
