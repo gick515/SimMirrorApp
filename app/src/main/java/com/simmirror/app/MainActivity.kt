@@ -1,0 +1,1940 @@
+package com.simmirror.app
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.*
+import android.content.*
+import android.content.pm.PackageManager
+import android.database.Cursor
+import android.graphics.*
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.*
+import android.provider.CallLog
+import android.provider.ContactsContract
+import android.provider.Settings
+import android.provider.Telephony
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+import android.telecom.TelecomManager
+import android.telephony.SmsManager
+import android.telephony.TelephonyManager
+import android.text.InputType
+import android.text.TextUtils
+import android.util.Base64
+import android.util.TypedValue
+import android.view.*
+import android.widget.*
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.*
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.PrintWriter
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.net.ServerSocket
+import java.net.Socket
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
+
+// ============================================================================
+// GLOBAL EVENT BUS & SHARED BRIDGE STATE
+// ============================================================================
+object MirrorBus {
+    var activeHostRole: Boolean = true
+    var onHardwarePacketGenerated: ((type: String, payload: String) -> Unit)? = null
+}
+
+// ============================================================================
+// AES-256-GCM OPTIONAL PIN ENCRYPTION ENGINE
+// ============================================================================
+object CryptoEngine {
+    private const val TRANSFORMATION = "AES/GCM/NoPadding"
+    private const val GCM_TAG_LENGTH = 128
+    private const val IV_LENGTH = 12
+
+    private fun deriveKey(pin: String): SecretKeySpec {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val keyBytes = digest.digest(pin.trim().toByteArray(Charsets.UTF_8))
+        return SecretKeySpec(keyBytes, "AES")
+    }
+
+    fun encrypt(plainText: String, pin: String): String {
+        if (pin.isBlank()) return plainText
+        return try {
+            val iv = ByteArray(IV_LENGTH)
+            SecureRandom().nextBytes(iv)
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, deriveKey(pin), GCMParameterSpec(GCM_TAG_LENGTH, iv))
+            val cipherText = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
+            val combined = ByteArray(iv.size + cipherText.size)
+            System.arraycopy(iv, 0, combined, 0, iv.size)
+            System.arraycopy(cipherText, 0, combined, iv.size, cipherText.size)
+            "ENC:" + Base64.encodeToString(combined, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            plainText
+        }
+    }
+
+    fun decrypt(rawText: String, pin: String): String {
+        if (!rawText.startsWith("ENC:")) return rawText
+        if (pin.isBlank()) return ""
+        return try {
+            val decoded = Base64.decode(rawText.removePrefix("ENC:"), Base64.NO_WRAP)
+            val iv = decoded.copyOfRange(0, IV_LENGTH)
+            val cipherText = decoded.copyOfRange(IV_LENGTH, decoded.size)
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.DECRYPT_MODE, deriveKey(pin), GCMParameterSpec(GCM_TAG_LENGTH, iv))
+            String(cipher.doFinal(cipherText), Charsets.UTF_8)
+        } catch (e: Exception) {
+            ""
+        }
+    }
+}
+
+// ============================================================================
+// PERSISTENT FOREGROUND SERVICE (WAKELOCK + WIFILOCK)
+// ============================================================================
+class MirrorForegroundService : Service() {
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        startPersistentNotification()
+        acquireLocks()
+    }
+
+    private fun startPersistentNotification() {
+        val channelId = "sim_mirror_ultra_channel"
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = NotificationChannel(
+            channelId,
+            "SIM Mirror Hub Core Bridge",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        nm.createNotificationChannel(channel)
+
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("SIM Mirror Hub v6.0 Ultra-Pro Active")
+            .setContentText("WakeLock & WifiLock engaged. Bridge streaming continuously.")
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setOngoing(true)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        startForeground(6001, notification)
+    }
+
+    @SuppressLint("WakelockTimeout")
+    private fun acquireLocks() {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SIMMirrorHub::CoreWakeLock").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "SIMMirrorHub::CoreWifiLock").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+    override fun onDestroy() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wifiLock?.let { if (it.isHeld) it.release() }
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+// ============================================================================
+// APP NOTIFICATION LISTENER SERVICE (WHATSAPP, TELEGRAM, BANKS, OTPs)
+// ============================================================================
+class MirrorNotificationService : NotificationListenerService() {
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        if (sbn == null || !MirrorBus.activeHostRole) return
+        val pkg = sbn.packageName ?: return
+        if (pkg == packageName || pkg == "android" || pkg == "com.android.systemui") return
+
+        val extras = sbn.notification.extras
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: pkg
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: return
+        if (text.isBlank()) return
+
+        val appLabel = when {
+            pkg.contains("whatsapp", true) -> "WhatsApp"
+            pkg.contains("telegram", true) || pkg.contains("messenger", true) -> "Telegram/Messenger"
+            pkg.contains("bank", true) || pkg.contains("pay", true) || pkg.contains("wallet", true) -> "Banking/Finance"
+            pkg.contains("mms", true) || pkg.contains("messaging", true) -> "Messaging"
+            else -> pkg.substringAfterLast('.')
+        }
+
+        val stamp = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        val formatted = "[$stamp] [$appLabel] $title: $text"
+        MirrorBus.onHardwarePacketGenerated?.invoke("APP_NOTIFICATION", formatted)
+    }
+}
+
+// ============================================================================
+// HARDWARE BROADCAST RECEIVER (INCOMING SMS & RINGING CALL DETECTION ON HOST)
+// ============================================================================
+class SimHardwareReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (!MirrorBus.activeHostRole) return
+        when (intent.action) {
+            Telephony.Sms.Intents.SMS_RECEIVED_ACTION -> {
+                val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
+                val sb = StringBuilder()
+                var sender = "Unknown"
+                for (msg in messages) {
+                    sender = msg.displayOriginatingAddress ?: sender
+                    sb.append(msg.displayMessageBody)
+                }
+                val stamp = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                MirrorBus.onHardwarePacketGenerated?.invoke(
+                    "INCOMING_SMS",
+                    "[$stamp] From $sender: $sb"
+                )
+            }
+            TelephonyManager.ACTION_PHONE_STATE_CHANGED -> {
+                val state = intent.getStringExtra(TelephonyManager.EXTRA_STATE)
+                val incomingNumber = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER) ?: "Private/Unknown"
+                if (state == TelephonyManager.EXTRA_STATE_RINGING) {
+                    MirrorBus.onHardwarePacketGenerated?.invoke("INCOMING_CALL", incomingNumber)
+                } else if (state == TelephonyManager.EXTRA_STATE_IDLE) {
+                    MirrorBus.onHardwarePacketGenerated?.invoke("CALL_ENDED", incomingNumber)
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// MAIN ACTIVITY: UNIFIED MASTER ENGINE & 3D UI CONTROLLER
+// ============================================================================
+class MainActivity : AppCompatActivity() {
+
+    enum class Role { HOST, REMOTE }
+    enum class LedState { DISCONNECTED, CONNECTING, CONNECTED }
+
+    private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private lateinit var prefs: SharedPreferences
+
+    // State Variables
+    private var currentRole = Role.HOST
+    private var isArabic = false
+    private var isDarkMode = true
+    private var selectedTabIndex = 0
+    private var ledState = LedState.DISCONNECTED
+    private var deviceId = UUID.randomUUID().toString().substring(0, 8)
+
+    // Network State (Multi-Client TCP + Ntfy.sh Cloud SSE)
+    private var tcpServerSocket: ServerSocket? = null
+    private val connectedClientWriters = CopyOnWriteArrayList<PrintWriter>()
+    private var remoteSocket: Socket? = null
+    private var remoteWriter: PrintWriter? = null
+    private var ntfyEventSourceCall: Call? = null
+    private val okHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MINUTES) // Infinite read for SSE stream
+        .build()
+
+    // Cached Data
+    private val hostContactsCache = mutableListOf<Pair<String, String>>() // Pair(Name, Number)
+    private val notificationsVaultList = mutableListOf<String>()
+    private val historyVaultList = mutableListOf<String>()
+
+    // Dynamic UI References
+    private lateinit var rootContainer: LinearLayout
+    private lateinit var headerBar: LinearLayout
+    private lateinit var ledIndicatorView: View
+    private lateinit var tvLedStatusLabel: TextView
+    private lateinit var btnLangToggle: TextView
+    private lateinit var btnThemeToggle: TextView
+    private lateinit var tabBarLayout: LinearLayout
+    private val tabButtons = mutableListOf<TextView>()
+    private val tabContainers = mutableListOf<ScrollView>()
+
+    // Form & Display Controls Across Tabs
+    private lateinit var etRoomTopic: EditText
+    private lateinit var etHostIpInput: EditText
+    private lateinit var etSecretPin: EditText
+    private lateinit var tvLocalIpDisplay: TextView
+    private lateinit var tvConnectionConsole: TextView
+
+    private lateinit var etDialNumber: EditText
+    private lateinit var tvCallLogsBox: TextView
+
+    private lateinit var etTargetSmsUssdNumber: EditText
+    private lateinit var etSmsMessageBody: EditText
+    private lateinit var tvSmsUssdResultBox: TextView
+
+    private lateinit var tvNotificationsBox: TextView
+    private lateinit var tvHistoryVaultBox: TextView
+
+    // Floating Incoming Call Banner / Overlay
+    private var floatingOverlayView: View? = null
+    private lateinit var inAppCallBanner: LinearLayout
+    private lateinit var tvIncomingCallerId: TextView
+
+    // Local Contact Picker Launcher (Fix #3)
+    private lateinit var localContactPickerLauncher: ActivityResultLauncher<Intent>
+
+    // Tab Accent Palette (Specifications Section 3.3)
+    private val tabColors = intArrayOf(
+        Color.parseColor("#0EA5E9"), // Tab 1: Connect (Cyber Cyan)
+        Color.parseColor("#10B981"), // Tab 2: Calls & Audio (Emerald Green)
+        Color.parseColor("#8B5CF6"), // Tab 3: SMS, USSD & Apps (Royal Purple)
+        Color.parseColor("#EC4899"), // Tab 4: Notifications Vault (Vibrant Rose)
+        Color.parseColor("#F59E0B")  // Tab 5: History Vault (Warm Amber)
+    )
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        prefs = getSharedPreferences("sim_mirror_v6_prefs", Context.MODE_PRIVATE)
+        isArabic = prefs.getBoolean("is_arabic", false)
+        isDarkMode = prefs.getBoolean("is_dark", true)
+        currentRole = if (prefs.getBoolean("is_host", true)) Role.HOST else Role.REMOTE
+        MirrorBus.activeHostRole = (currentRole == Role.HOST)
+
+        loadPersistedVaults()
+        registerContactPicker()
+        requestRuntimePermissions()
+
+        // Hook Hardware Events to Network Bridge
+        MirrorBus.onHardwarePacketGenerated = { type, payload ->
+            mainScope.launch {
+                appendVaultEntry("[$type] $payload")
+                if (type == "APP_NOTIFICATION") {
+                    notificationsVaultList.add(0, payload)
+                    refreshNotificationsUI()
+                }
+                transmitPacket(type, payload)
+            }
+        }
+
+        // Start Background Foreground Service
+        ContextCompat.startForegroundService(this, Intent(this, MirrorForegroundService::class.java))
+
+        buildMasterUI()
+        applyThemeAndLanguage()
+    }
+
+    // ========================================================================
+    // LOCALIZATION DICTIONARY (EN / AR)
+    // ========================================================================
+    private fun tr(en: String, ar: String): String = if (isArabic) ar else en
+
+    // ========================================================================
+    // 3D TACTILE UI FACTORY (ELEVATION, BEVEL LEDGE, PRESS ANIMATION & HAPTICS)
+    // ========================================================================
+    private fun dp(value: Int): Int =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics).toInt()
+
+    private fun darkenColor(color: Int, factor: Float = 0.68f): Int {
+        val r = (Color.red(color) * factor).toInt().coerceIn(0, 255)
+        val g = (Color.green(color) * factor).toInt().coerceIn(0, 255)
+        val b = (Color.blue(color) * factor).toInt().coerceIn(0, 255)
+        return Color.rgb(r, g, b)
+    }
+
+    private fun create3DDrawable(faceColor: Int, cornerRadiusDp: Int = 12, bevelHeightDp: Int = 5): LayerDrawable {
+        val radius = dp(cornerRadiusDp).toFloat()
+        val bevel = dp(bevelHeightDp)
+
+        val shadowLayer = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = radius
+            setColor(darkenColor(faceColor, 0.55f))
+        }
+
+        val highlightStroke = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = radius
+            setColor(faceColor)
+            setStroke(dp(1), Color.argb(90, 255, 255, 255))
+        }
+
+        return LayerDrawable(arrayOf(shadowLayer, highlightStroke)).apply {
+            setLayerInset(0, 0, bevel, 0, 0)
+            setLayerInset(1, 0, 0, 0, bevel)
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun create3DButton(
+        textEn: String,
+        textAr: String,
+        baseColor: Int,
+        textSizeSp: Float = 13f,
+        onClick: () -> Unit
+    ): TextView {
+        return TextView(this).apply {
+            text = tr(textEn, textAr)
+            setTextColor(Color.WHITE)
+            textSize = textSizeSp
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(12), dp(14), dp(16))
+            background = create3DDrawable(baseColor, cornerRadiusDp = 12, bevelHeightDp = 5)
+            elevation = dp(4).toFloat()
+
+            setOnTouchListener { v, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        v.translationY = dp(4).toFloat()
+                        v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        v.translationY = 0f
+                        onClick()
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        v.translationY = 0f
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    private fun createCardContainer(accentColor: Int): LinearLayout {
+        val cardBg = if (isDarkMode) Color.parseColor("#1E293B") else Color.parseColor("#FFFFFF")
+        val borderColor = if (isDarkMode) darkenColor(accentColor, 0.85f) else accentColor
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(16).toFloat()
+                setColor(cardBg)
+                setStroke(dp(2), borderColor)
+            }
+            elevation = dp(6).toFloat()
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            lp.setMargins(0, 0, 0, dp(14))
+            layoutParams = lp
+        }
+    }
+
+    private fun createSectionHeaderWithInfo(
+        titleEn: String,
+        titleAr: String,
+        infoEn: String,
+        infoAr: String,
+        accentColor: Int
+    ): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(10))
+
+            val titleView = TextView(this@MainActivity).apply {
+                text = tr(titleEn, titleAr)
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(accentColor)
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            val infoBtn = create3DButton("ℹ️ Info", "ℹ️ معلومات", Color.parseColor("#475569"), 11f) {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle(tr(titleEn, titleAr))
+                    .setMessage(tr(infoEn, infoAr))
+                    .setPositiveButton(tr("Got It", "حسناً"), null)
+                    .show()
+            }.apply {
+                setPadding(dp(10), dp(6), dp(10), dp(10))
+            }
+
+            addView(titleView)
+            addView(infoBtn)
+        }
+    }
+
+    private fun styleInputEditText(hintEn: String, hintAr: String, defaultText: String = ""): EditText {
+        val bg = if (isDarkMode) Color.parseColor("#0F172A") else Color.parseColor("#F1F5F9")
+        val fg = if (isDarkMode) Color.parseColor("#F8FAFC") else Color.parseColor("#0F172A")
+        val hintColor = if (isDarkMode) Color.parseColor("#64748B") else Color.parseColor("#94A3B8")
+        return EditText(this).apply {
+            hint = tr(hintEn, hintAr)
+            setText(defaultText)
+            setTextColor(fg)
+            setHintTextColor(hintColor)
+            textSize = 14f
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(10).toFloat()
+                setColor(bg)
+                setStroke(dp(1), Color.parseColor("#334155"))
+            }
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            lp.setMargins(0, dp(4), 0, dp(10))
+            layoutParams = lp
+        }
+    }
+
+    // ========================================================================
+    // MASTER UI CONSTRUCTION (TOP HEADER + LED + 5 PINNED TABS)
+    // ========================================================================
+    private fun buildMasterUI() {
+        rootContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+
+        // 1. TOP HEADER BAR WITH DYNAMIC LED & LANGUAGE/THEME TACTILE TOGGLES
+        headerBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+
+        val titleColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val appTitle = TextView(this).apply {
+            text = "SIM Mirror Hub v6.0"
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#38BDF8"))
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+
+        tvLedStatusLabel = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.parseColor("#94A3B8"))
+            maxLines = 1
+        }
+
+        titleColumn.addView(appTitle)
+        titleColumn.addView(tvLedStatusLabel)
+
+        // Large Clear Dynamic LED Circle (Positioned right next to Language & Theme buttons)
+        ledIndicatorView = View(this).apply {
+            val size = dp(24)
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                marginEnd = dp(10)
+                marginStart = dp(6)
+            }
+        }
+
+        btnLangToggle = create3DButton(
+            if (isArabic) "🌐 AR" else "🌐 EN",
+            if (isArabic) "🌐 AR" else "🌐 EN",
+            Color.parseColor("#2563EB"),
+            12f
+        ) {
+            isArabic = !isArabic
+            prefs.edit().putBoolean("is_arabic", isArabic).apply()
+            rebuildUIPreservingState()
+        }.apply {
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.marginEnd = dp(6)
+            layoutParams = lp
+        }
+
+        btnThemeToggle = create3DButton(
+            if (isDarkMode) "🌙 Dark" else "☀️ Light",
+            if (isDarkMode) "🌙 داكن" else "☀️ فاتح",
+            Color.parseColor("#4F46E5"),
+            12f
+        ) {
+            isDarkMode = !isDarkMode
+            prefs.edit().putBoolean("is_dark", isDarkMode).apply()
+            rebuildUIPreservingState()
+        }
+
+        headerBar.addView(titleColumn)
+        headerBar.addView(ledIndicatorView)
+        headerBar.addView(btnLangToggle)
+        headerBar.addView(btnThemeToggle)
+        rootContainer.addView(headerBar)
+
+        // 2. FLOATING IN-APP INCOMING CALL BANNER (REMOTE ALERT + SPEAKER ANSWER)
+        inAppCallBanner = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(Color.parseColor("#DC2626"))
+        }
+        tvIncomingCallerId = TextView(this).apply {
+            textColor = Color.WHITE
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val btnBannerAnswer = create3DButton("🔊 Answer", "🔊 رد ومكبر", Color.parseColor("#16A34A"), 12f) {
+            sendRemoteCommand("ANSWER_CALL", "FORCE_SPEAKER")
+            hideIncomingCallOverlay()
+        }
+        val btnBannerDismiss = create3DButton("✖", "✖", Color.parseColor("#7F1D1D"), 12f) {
+            hideIncomingCallOverlay()
+        }.apply {
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.marginStart = dp(6)
+            layoutParams = lp
+        }
+        inAppCallBanner.addView(tvIncomingCallerId)
+        inAppCallBanner.addView(btnBannerAnswer)
+        inAppCallBanner.addView(btnBannerDismiss)
+        rootContainer.addView(inAppCallBanner)
+
+        // 3. PINNED 5-TAB BAR (SINGLE LINE, 3D TACTILE ELEVATION)
+        tabBarLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(6), dp(6), dp(6), dp(8))
+        }
+        val tabTitlesEn = listOf(
+            "Connect",
+            "Calls & Audio",
+            "SMS, USSD & Apps",
+            "Notifications Vault",
+            "History Vault"
+        )
+        val tabTitlesAr = listOf(
+            "الاتصال",
+            "المكالمات",
+            "الرسائل و USSD",
+            "خزنة الإشعارات",
+            "خزنة السجل"
+        )
+
+        tabButtons.clear()
+        for (i in 0 until 5) {
+            val tabBtn = TextView(this).apply {
+                text = tr(tabTitlesEn[i], tabTitlesAr[i])
+                textSize = 10.5f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                maxLines = 1
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(dp(4), dp(10), dp(4), dp(13))
+                val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                lp.setMargins(dp(2), 0, dp(2), 0)
+                layoutParams = lp
+                setOnClickListener {
+                    it.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    switchTab(i)
+                }
+            }
+            tabButtons.add(tabBtn)
+            tabBarLayout.addView(tabBtn)
+        }
+        rootContainer.addView(tabBarLayout)
+
+        // 4. CONTENT FRAME HOLDING THE 5 TAB SCROLLVIEWS
+        val contentFrame = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+
+        tabContainers.clear()
+        tabContainers.add(buildTab1Connect())
+        tabContainers.add(buildTab2CallsAudio())
+        tabContainers.add(buildTab3SmsUssdApps())
+        tabContainers.add(buildTab4NotificationsVault())
+        tabContainers.add(buildTab5HistoryVault())
+
+        tabContainers.forEach { contentFrame.addView(it) }
+        rootContainer.addView(contentFrame)
+
+        setContentView(rootContainer)
+        updateLedIndicator(ledState)
+        switchTab(selectedTabIndex)
+    }
+
+    private fun rebuildUIPreservingState() {
+        val savedTopic = if (::etRoomTopic.isInitialized) etRoomTopic.text.toString() else prefs.getString("topic", "simhub_v6_ultra") ?: "simhub_v6_ultra"
+        val savedIp = if (::etHostIpInput.isInitialized) etHostIpInput.text.toString() else prefs.getString("host_ip", "192.168.43.1") ?: "192.168.43.1"
+        val savedPin = if (::etSecretPin.isInitialized) etSecretPin.text.toString() else prefs.getString("pin", "") ?: ""
+        prefs.edit().putString("topic", savedTopic).putString("host_ip", savedIp).putString("pin", savedPin).apply()
+
+        buildMasterUI()
+        applyThemeAndLanguage()
+    }
+
+    private fun applyThemeAndLanguage() {
+        window.decorView.layoutDirection = if (isArabic) View.LAYOUT_DIRECTION_RTL else View.LAYOUT_DIRECTION_LTR
+        val rootBg = if (isDarkMode) Color.parseColor("#0B1120") else Color.parseColor("#E2E8F0")
+        val headerBg = if (isDarkMode) Color.parseColor("#111827") else Color.parseColor("#FFFFFF")
+        rootContainer.setBackgroundColor(rootBg)
+        headerBar.setBackgroundColor(headerBg)
+        tabBarLayout.setBackgroundColor(headerBg)
+        switchTab(selectedTabIndex)
+    }
+
+    private fun switchTab(index: Int) {
+        selectedTabIndex = index
+        for (i in 0 until 5) {
+            tabContainers[i].visibility = if (i == index) View.VISIBLE else View.GONE
+            val activeColor = tabColors[i]
+            val inactiveColor = if (isDarkMode) Color.parseColor("#334155") else Color.parseColor("#94A3B8")
+            tabButtons[i].background = create3DDrawable(
+                if (i == index) activeColor else inactiveColor,
+                cornerRadiusDp = 10,
+                bevelHeightDp = if (i == index) 5 else 3
+            )
+            tabButtons[i].translationY = if (i == index) 0f else dp(1).toFloat()
+        }
+    }
+
+    private fun updateLedIndicator(state: LedState) {
+        ledState = state
+        val (ledColor, statusEn, statusAr) = when (state) {
+            LedState.DISCONNECTED -> Triple(
+                Color.parseColor("#EF4444"),
+                "🔴 Disconnected / Offline",
+                "🔴 غير متصل / متوقف"
+            )
+            LedState.CONNECTING -> Triple(
+                Color.parseColor("#F59E0B"),
+                "🟠 Connecting / Handshaking...",
+                "🟠 جاري الاتصال والمصافحة..."
+            )
+            LedState.CONNECTED -> Triple(
+                Color.parseColor("#10B981"),
+                "🟢 Connected & Stable (${currentRole.name})",
+                "🟢 متصل ومستقر (${if (currentRole == Role.HOST) "مضيف" else "بعيد"})"
+            )
+        }
+
+        ledIndicatorView.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(ledColor)
+            setStroke(dp(3), Color.argb(110, 255, 255, 255))
+        }
+        tvLedStatusLabel.text = tr(statusEn, statusAr)
+    }
+
+    // ========================================================================
+    // TAB 1: CONNECT (CYBER CYAN #0EA5E9)
+    // ========================================================================
+    private fun buildTab1Connect(): ScrollView {
+        val accent = tabColors[0]
+        val scroll = ScrollView(this)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(24))
+        }
+
+        // Role Selection Card
+        val roleCard = createCardContainer(accent)
+        roleCard.addView(
+            createSectionHeaderWithInfo(
+                "1. Device Operating Role",
+                "1. وضع تشغيل الجهاز",
+                "Select HOST on the primary phone holding the physical SIM card. Select REMOTE on secondary phones to control the Host SIM from anywhere.",
+                "اختر (الهاتف المضيف) في الهاتف الذي يحتوي على شريحة SIM الفعلية. اختر (الهاتف البعيد) للتحكم في الشريحة عن بعد.",
+                accent
+            )
+        )
+
+        val roleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btnHostRole = create3DButton(
+            "📡 HOST (SIM Phone)",
+            "📡 المضيف (هاتف الشريحة)",
+            if (currentRole == Role.HOST) accent else Color.parseColor("#475569")
+        ) {
+            currentRole = Role.HOST
+            MirrorBus.activeHostRole = true
+            prefs.edit().putBoolean("is_host", true).apply()
+            rebuildUIPreservingState()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+        }
+
+        val btnRemoteRole = create3DButton(
+            "📱 REMOTE (Controller)",
+            "📱 البعيد (جهاز التحكم)",
+            if (currentRole == Role.REMOTE) accent else Color.parseColor("#475569")
+        ) {
+            currentRole = Role.REMOTE
+            MirrorBus.activeHostRole = false
+            prefs.edit().putBoolean("is_host", false).apply()
+            rebuildUIPreservingState()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        roleRow.addView(btnHostRole)
+        roleRow.addView(btnRemoteRole)
+        roleCard.addView(roleRow)
+        container.addView(roleCard)
+
+        // Cloud & Local Wi-Fi Bridge Configuration Card
+        val bridgeCard = createCardContainer(accent)
+        bridgeCard.addView(
+            createSectionHeaderWithInfo(
+                "2. Cloud (Ntfy.sh) & Local Hotspot Bridge",
+                "2. جسر السحابة (Ntfy) والشبكة المحلية",
+                "Enter an identical Room Topic and optional AES-256 PIN on both phones. Cloud Stream works globally over mobile data; Local TCP works offline via Wi-Fi/Hotspot.",
+                "أدخل نفس اسم الغرفة ورمز التشفير AES-256 في الهاتفين. البث السحابي يعمل عبر الإنترنت عالمياً، بينما يعمل TCP محلياً بدون إنترنت.",
+                accent
+            )
+        )
+
+        tvLocalIpDisplay = TextView(this).apply {
+            text = tr("Local Wi-Fi/Hotspot IP: ${getLocalIpAddress()} (Port 8989)", "عنوان IP المحلي: ${getLocalIpAddress()} (منفذ 8989)")
+            setTextColor(accent)
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(8))
+        }
+        bridgeCard.addView(tvLocalIpDisplay)
+
+        etRoomTopic = styleInputEditText(
+            "Cloud Room Topic (e.g. simhub_v6_ultra)",
+            "اسم الغرفة السحابية (مثال simhub_v6_ultra)",
+            prefs.getString("topic", "simhub_v6_ultra") ?: "simhub_v6_ultra"
+        )
+        etHostIpInput = styleInputEditText(
+            "Host Local IP for Direct Wi-Fi (e.g. 192.168.43.1)",
+            "عنوان IP للهاتف المضيف للشبكة المحلية",
+            prefs.getString("host_ip", getLocalIpAddress()) ?: "192.168.43.1"
+        )
+        etSecretPin = styleInputEditText(
+            "Optional AES-256 Secret PIN (Leave empty for none)",
+            "رمز التشفير السري AES-256 (اختياري)",
+            prefs.getString("pin", "") ?: ""
+        ).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+
+        bridgeCard.addView(etRoomTopic)
+        bridgeCard.addView(etHostIpInput)
+        bridgeCard.addView(etSecretPin)
+
+        val connectBtnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btnStartCloud = create3DButton("☁️ Start Cloud Stream", "☁️ بدء البث السحابي", accent) {
+            startCloudBridge()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+        }
+
+        val btnStartLocal = create3DButton("📶 Start Local Wi-Fi", "📶 بدء الشبكة المحلية", Color.parseColor("#0284C7")) {
+            startLocalTcpBridge()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        connectBtnRow.addView(btnStartCloud)
+        connectBtnRow.addView(btnStartLocal)
+        bridgeCard.addView(connectBtnRow)
+
+        val btnDisconnectAll = create3DButton("🛑 Stop All Bridges", "🛑 إيقاف جميع الجسور", Color.parseColor("#DC2626")) {
+            stopAllBridges()
+        }.apply {
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.topMargin = dp(8)
+            layoutParams = lp
+        }
+        bridgeCard.addView(btnDisconnectAll)
+
+        tvConnectionConsole = TextView(this).apply {
+            text = tr("Bridge Console Ready...", "وحدة تحكم الجسر جاهزة...")
+            textSize = 12f
+            setTextColor(if (isDarkMode) Color.parseColor("#CBD5E1") else Color.parseColor("#334155"))
+            setPadding(dp(8), dp(10), dp(8), dp(4))
+        }
+        bridgeCard.addView(tvConnectionConsole)
+        container.addView(bridgeCard)
+
+        scroll.addView(container)
+        return scroll
+    }
+
+    // ========================================================================
+    // TAB 2: CALLS & AUDIO (EMERALD GREEN #10B981) - FIX #1 & FIX #4
+    // ========================================================================
+    private fun buildTab2CallsAudio(): ScrollView {
+        val accent = tabColors[1]
+        val scroll = ScrollView(this)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(24))
+        }
+
+        val callCard = createCardContainer(accent)
+        callCard.addView(
+            createSectionHeaderWithInfo(
+                "Remote Dialer & 3-Stage Speaker Force",
+                "الاتصال عن بعد وفرض مكبر الصوت الثلاثي",
+                "Dial any number through the Host SIM, or answer an incoming Host call with our 3-stage (0.5s, 1.2s, 2.0s) hardware speakerphone enforcer.",
+                "اتصل بأي رقم عبر شريحة المضيف، أو رد على المكالمات الواردة مع تفعيل مكبر الصوت تلقائياً عبر 3 مراحل زمنية متتالية بأقصى صوت.",
+                accent
+            )
+        )
+
+        etDialNumber = styleInputEditText("Enter Phone Number to Dial via Host", "أدخل رقم الهاتف للاتصال عبر المضيف")
+        etDialNumber.inputType = InputType.TYPE_CLASS_PHONE
+        callCard.addView(etDialNumber)
+
+        val dialActionsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btnDial = create3DButton("📞 Dial on Host", "📞 اتصال من المضيف", accent) {
+            val num = etDialNumber.text.toString().trim()
+            if (num.isNotEmpty()) {
+                if (currentRole == Role.HOST) executeHostDial(num)
+                else sendRemoteCommand("DIAL_CALL", num)
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+        }
+
+        val btnAnswerSpeaker = create3DButton("🔊 Answer + Force Speaker", "🔊 رد + مكبر الصوت", Color.parseColor("#059669")) {
+            if (currentRole == Role.HOST) answerIncomingCallAndForceSpeaker()
+            else sendRemoteCommand("ANSWER_CALL", "FORCE_SPEAKER")
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        dialActionsRow.addView(btnDial)
+        dialActionsRow.addView(btnAnswerSpeaker)
+        callCard.addView(dialActionsRow)
+
+        container.addView(callCard)
+
+        // Call Logs Synchronization Card (Mandatory Fix #1: SYNC_CALL_LOG -> CALL_LOG_DATA)
+        val logsCard = createCardContainer(accent)
+        logsCard.addView(
+            createSectionHeaderWithInfo(
+                "Host Call Logs Sync (SYNC_CALL_LOG)",
+                "مزامنة سجل مكالمات المضيف",
+                "Fetches the last 25 calls directly from the Host SIM phone's CallLog provider and returns them via CALL_LOG_DATA packet.",
+                "يجلب آخر 25 مكالمة مباشرة من سجل الهاتف المضيف ويرسلها عبر حزمة CALL_LOG_DATA لعرضها على الهاتف البعيد.",
+                accent
+            )
+        )
+
+        val btnSyncCallLogs = create3DButton(
+            "🔄 Sync Host Call Logs Now",
+            "🔄 مزامنة سجل مكالمات المضيف الآن",
+            accent
+        ) {
+            if (currentRole == Role.HOST) {
+                val hostLogs = readLastCalls()
+                tvCallLogsBox.text = hostLogs
+                transmitPacket("CALL_LOG_DATA", hostLogs)
+            } else {
+                tvCallLogsBox.text = tr("Requesting Host Call Logs (SYNC_CALL_LOG)...", "جاري طلب سجل مكالمات المضيف...")
+                sendRemoteCommand("SYNC_CALL_LOG", "LAST_25")
+            }
+        }
+        logsCard.addView(btnSyncCallLogs)
+
+        tvCallLogsBox = TextView(this).apply {
+            text = tr("No Host call logs synced yet.", "لم تتم مزامنة سجل المكالمات بعد.")
+            textSize = 12.5f
+            setTextColor(if (isDarkMode) Color.parseColor("#E2E8F0") else Color.parseColor("#1E293B"))
+            setPadding(dp(8), dp(12), dp(8), dp(6))
+        }
+        logsCard.addView(tvCallLogsBox)
+        container.addView(logsCard)
+
+        scroll.addView(container)
+        return scroll
+    }
+
+    // ========================================================================
+    // TAB 3: SMS, USSD & APPS (ROYAL PURPLE #8B5CF6) - FIX #2 & FIX #3
+    // ========================================================================
+    private fun buildTab3SmsUssdApps(): ScrollView {
+        val accent = tabColors[2]
+        val scroll = ScrollView(this)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(24))
+        }
+
+        val smsCard = createCardContainer(accent)
+        smsCard.addView(
+            createSectionHeaderWithInfo(
+                "SMS Dispatch, USSD Codes & Dual Contact Picker",
+                "إرسال الرسائل، أكواد USSD، واختيار جهات الاتصال",
+                "Pick a number from your Local Contacts or remotely synced Host Contacts (CONTACTS_DATA), then send an SMS or execute a carrier USSD code.",
+                "اختر رقماً من جهات اتصالك المحلية أو من جهات اتصال الهاتف المضيف السحابية، ثم أرسل رسالة نصية أو نفذ كود USSD.",
+                accent
+            )
+        )
+
+        // Mandatory Fix #3: Dedicated Local & Host Contact Picker Buttons
+        val contactPickerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
+        }
+
+        val btnPickLocalContact = create3DButton(
+            "📱 Pick Local Contact",
+            "📱 جهة اتصال محلية",
+            Color.parseColor("#7C3AED"),
+            12f
+        ) {
+            val pickIntent = Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)
+            localContactPickerLauncher.launch(pickIntent)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+        }
+
+        val btnPickHostContact = create3DButton(
+            "☁️ Pick Host Contact",
+            "☁️ جهة اتصال المضيف",
+            Color.parseColor("#6D28D9"),
+            12f
+        ) {
+            showHostContactsPickerDialog()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        contactPickerRow.addView(btnPickLocalContact)
+        contactPickerRow.addView(btnPickHostContact)
+        smsCard.addView(contactPickerRow)
+
+        val btnSyncContacts = create3DButton(
+            "🔄 Sync Host Contacts Database (SYNC_CONTACTS)",
+            "🔄 مزامنة جهات اتصال المضيف",
+            Color.parseColor("#5B21B6"),
+            12f
+        ) {
+            if (currentRole == Role.HOST) {
+                val payload = readHostContactsPayload()
+                parseAndCacheHostContacts(payload)
+                transmitPacket("CONTACTS_DATA", payload)
+                Toast.makeText(this, tr("Host Contacts Broadcasted (${hostContactsCache.size})", "تم بث جهات اتصال المضيف"), Toast.LENGTH_SHORT).show()
+            } else {
+                sendRemoteCommand("SYNC_CONTACTS", "ALL")
+                Toast.makeText(this, tr("Requesting Host Contacts...", "جاري جلب جهات اتصال المضيف..."), Toast.LENGTH_SHORT).show()
+            }
+        }.apply {
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
+        }
+        smsCard.addView(btnSyncContacts)
+
+        etTargetSmsUssdNumber = styleInputEditText(
+            "Target Number or USSD Code (e.g. *100#)",
+            "الرقم المستهدف أو كود USSD (مثال *100#)"
+        )
+        etSmsMessageBody = styleInputEditText(
+            "SMS Message Content (Leave empty if running USSD)",
+            "نص الرسالة القصيرة SMS"
+        )
+        smsCard.addView(etTargetSmsUssdNumber)
+        smsCard.addView(etSmsMessageBody)
+
+        val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btnSendSms = create3DButton("✉️ Send SMS via Host", "✉️ إرسال SMS عبر المضيف", accent) {
+            val target = etTargetSmsUssdNumber.text.toString().trim()
+            val body = etSmsMessageBody.text.toString().trim()
+            if (target.isNotEmpty() && body.isNotEmpty()) {
+                val combined = "$target|$body"
+                if (currentRole == Role.HOST) executeHostSendSms(target, body)
+                else sendRemoteCommand("SEND_SMS", combined)
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+        }
+
+        val btnRunUssd = create3DButton("#️⃣ Execute USSD", "#️⃣ تنفيذ كود USSD", Color.parseColor("#9333EA")) {
+            val code = etTargetSmsUssdNumber.text.toString().trim()
+            if (code.isNotEmpty()) {
+                if (currentRole == Role.HOST) executeHostUssd(code)
+                else sendRemoteCommand("RUN_USSD", code)
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        actionRow.addView(btnSendSms)
+        actionRow.addView(btnRunUssd)
+        smsCard.addView(actionRow)
+
+        tvSmsUssdResultBox = TextView(this).apply {
+            text = tr("SMS & USSD responses will appear here.", "ستظهر ردود الرسائل وأكواد USSD هنا.")
+            textSize = 12.5f
+            setTextColor(if (isDarkMode) Color.parseColor("#E2E8F0") else Color.parseColor("#1E293B"))
+            setPadding(dp(8), dp(12), dp(8), dp(4))
+        }
+        smsCard.addView(tvSmsUssdResultBox)
+        container.addView(smsCard)
+
+        scroll.addView(container)
+        return scroll
+    }
+
+    // ========================================================================
+    // TAB 4: NOTIFICATIONS VAULT (ROSE #EC4899)
+    // ========================================================================
+    private fun buildTab4NotificationsVault(): ScrollView {
+        val accent = tabColors[3]
+        val scroll = ScrollView(this)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(24))
+        }
+
+        val notifCard = createCardContainer(accent)
+        notifCard.addView(
+            createSectionHeaderWithInfo(
+                "Real-Time App Notifications Vault",
+                "خزنة إشعارات التطبيقات الفورية",
+                "Captures WhatsApp, Telegram, Banking OTPs, and system notifications from the Host phone and streams them securely to connected Remote clients.",
+                "يلتقط إشعارات واتساب وتيليجرام والبنوك من الهاتف المضيف ويبثها فوراً إلى الهواتف البعيدة المتصلة.",
+                accent
+            )
+        )
+
+        val btnGrantNotifAccess = create3DButton(
+            "🔐 Enable Notification Listener Permission",
+            "🔐 تفعيل صلاحية قراءة الإشعارات",
+            accent
+        ) {
+            startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
+        }
+        notifCard.addView(btnGrantNotifAccess)
+
+        tvNotificationsBox = TextView(this).apply {
+            textSize = 12.5f
+            setTextColor(if (isDarkMode) Color.parseColor("#F8FAFC") else Color.parseColor("#1E293B"))
+            setPadding(dp(8), dp(12), dp(8), dp(6))
+        }
+        refreshNotificationsUI()
+        notifCard.addView(tvNotificationsBox)
+        container.addView(notifCard)
+
+        scroll.addView(container)
+        return scroll
+    }
+
+    // ========================================================================
+    // TAB 5: HISTORY VAULT (WARM AMBER #F59E0B) - 15 CRITICAL ENTRIES PROTECTED
+    // ========================================================================
+    private fun buildTab5HistoryVault(): ScrollView {
+        val accent = tabColors[4]
+        val scroll = ScrollView(this)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(24))
+        }
+
+        val vaultCard = createCardContainer(accent)
+        vaultCard.addView(
+            createSectionHeaderWithInfo(
+                "Persistent History Vault (15-Entry Lock)",
+                "خزنة السجل الدائم (حماية آخر 15 سجل)",
+                "Locally archives all synced Call Logs, SMS messages, USSD responses, and App Notifications. Selective prune automatically protects the 15 most recent critical entries.",
+                "تحتفظ محلياً بجميع سجلات المكالمات والرسائل والإشعارات. الحذف الذكي يحمي تلقائياً آخر 15 إدخالاً هاماً من المسح.",
+                accent
+            )
+        )
+
+        val clearBtnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btnSelectiveClear = create3DButton(
+            "🛡️ Clear Older (Keep Last 15)",
+            "🛡️ مسح القديم (حماية آخر 15)",
+            accent,
+            12f
+        ) {
+            if (historyVaultList.size > 15) {
+                val protectedSublist = historyVaultList.take(15).toMutableList()
+                historyVaultList.clear()
+                historyVaultList.addAll(protectedSublist)
+                savePersistedVaults()
+                refreshHistoryVaultUI()
+            }
+            Toast.makeText(this, tr("Protected latest 15 critical entries.", "تمت حماية آخر 15 سجلاً هاماً."), Toast.LENGTH_SHORT).show()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+        }
+
+        val btnFullClear = create3DButton(
+            "🗑️ Full Purge",
+            "🗑️ مسح شامل",
+            Color.parseColor("#DC2626"),
+            12f
+        ) {
+            AlertDialog.Builder(this)
+                .setTitle(tr("Confirm Full Vault Purge", "تأكيد المسح الشامل"))
+                .setMessage(tr("Clear all entries including the 15 protected records?", "هل تريد مسح جميع السجلات بما فيها الـ 15 المحمية؟"))
+                .setPositiveButton(tr("Purge All", "مسح الكل")) { _, _ ->
+                    historyVaultList.clear()
+                    savePersistedVaults()
+                    refreshHistoryVaultUI()
+                }
+                .setNegativeButton(tr("Cancel", "إلغاء"), null)
+                .show()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        clearBtnRow.addView(btnSelectiveClear)
+        clearBtnRow.addView(btnFullClear)
+        vaultCard.addView(clearBtnRow)
+
+        tvHistoryVaultBox = TextView(this).apply {
+            textSize = 12.5f
+            setTextColor(if (isDarkMode) Color.parseColor("#F8FAFC") else Color.parseColor("#1E293B"))
+            setPadding(dp(8), dp(12), dp(8), dp(6))
+        }
+        refreshHistoryVaultUI()
+        vaultCard.addView(tvHistoryVaultBox)
+        container.addView(vaultCard)
+
+        scroll.addView(container)
+        return scroll
+    }
+
+    // ========================================================================
+    // MANDATORY FIX #1: HOST CALL LOGS READER (SYNC_CALL_LOG -> CALL_LOG_DATA)
+    // ========================================================================
+    @SuppressLint("Range")
+    private fun readLastCalls(): String {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            return tr("⚠️ READ_CALL_LOG permission missing on Host.", "⚠️ صلاحية قراءة سجل المكالمات غير مفعلة في المضيف.")
+        }
+        val sb = StringBuilder()
+        val cursor: Cursor? = contentResolver.query(
+            CallLog.Calls.CONTENT_URI,
+            arrayOf(
+                CallLog.Calls.NUMBER,
+                CallLog.Calls.CACHED_NAME,
+                CallLog.Calls.TYPE,
+                CallLog.Calls.DATE,
+                CallLog.Calls.DURATION
+            ),
+            null,
+            null,
+            "${CallLog.Calls.DATE} DESC"
+        )
+        cursor?.use { c ->
+            var count = 0
+            val df = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
+            while (c.moveToNext() && count < 25) {
+                val number = c.getString(c.getColumnIndex(CallLog.Calls.NUMBER)) ?: "Unknown"
+                val name = c.getString(c.getColumnIndex(CallLog.Calls.CACHED_NAME))?.takeIf { it.isNotBlank() } ?: "No Name"
+                val typeInt = c.getInt(c.getColumnIndex(CallLog.Calls.TYPE))
+                val dateMs = c.getLong(c.getColumnIndex(CallLog.Calls.DATE))
+                val durationSec = c.getLong(c.getColumnIndex(CallLog.Calls.DURATION))
+
+                val typeIcon = when (typeInt) {
+                    CallLog.Calls.INCOMING_TYPE -> "↙️ IN"
+                    CallLog.Calls.OUTGOING_TYPE -> "↗️ OUT"
+                    CallLog.Calls.MISSED_TYPE -> "❌ MISSED"
+                    CallLog.Calls.REJECTED_TYPE -> "🚫 REJ"
+                    else -> "📞 CALL"
+                }
+                sb.append("[$typeIcon] $name ($number) • ${df.format(Date(dateMs))} (${durationSec}s)\n")
+                count++
+            }
+        }
+        return if (sb.isEmpty()) tr("Host Call Log is empty.", "سجل مكالمات المضيف فارغ.") else sb.toString().trim()
+    }
+
+    // ========================================================================
+    // MANDATORY FIX #2 & #3: HOST CONTACTS SYNC & DUAL CONTACT PICKERS
+    // ========================================================================
+    private fun registerContactPicker() {
+        localContactPickerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                val contactUri: Uri = result.data?.data ?: return@registerForActivityResult
+                val projection = arrayOf(
+                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.Phone.NUMBER
+                )
+                contentResolver.query(contactUri, projection, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val name = cursor.getString(0) ?: ""
+                        val number = cursor.getString(1)?.replace("\\s+".toRegex(), "") ?: ""
+                        if (::etTargetSmsUssdNumber.isInitialized) {
+                            etTargetSmsUssdNumber.setText(number)
+                        }
+                        Toast.makeText(this, tr("Selected Local: $name ($number)", "تم اختيار: $name"), Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+    }
+
+    @SuppressLint("Range")
+    private fun readHostContactsPayload(): String {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            return ""
+        }
+        val arr = JSONArray()
+        val seen = HashSet<String>()
+        val cursor = contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            ),
+            null,
+            null,
+            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
+        )
+        cursor?.use { c ->
+            while (c.moveToNext() && arr.length() < 250) {
+                val name = c.getString(0)?.trim() ?: continue
+                val num = c.getString(1)?.replace("\\s+".toRegex(), "") ?: continue
+                val key = "$name|$num"
+                if (seen.add(key)) {
+                    val obj = JSONObject()
+                    obj.put("n", name)
+                    obj.put("p", num)
+                    arr.put(obj)
+                }
+            }
+        }
+        return arr.toString()
+    }
+
+    private fun parseAndCacheHostContacts(jsonStr: String) {
+        try {
+            val arr = JSONArray(jsonStr)
+            hostContactsCache.clear()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                hostContactsCache.add(Pair(obj.getString("n"), obj.getString("p")))
+            }
+            prefs.edit().putString("cached_host_contacts", jsonStr).apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun showHostContactsPickerDialog() {
+        if (hostContactsCache.isEmpty()) {
+            if (currentRole == Role.HOST) {
+                parseAndCacheHostContacts(readHostContactsPayload())
+            } else {
+                sendRemoteCommand("SYNC_CONTACTS", "ALL")
+                Toast.makeText(
+                    this,
+                    tr("Fetching Host contacts via CONTACTS_DATA... Try again in 2 seconds.", "جاري جلب جهات اتصال المضيف... حاول بعد ثانيتين."),
+                    Toast.LENGTH_LONG
+                ).show()
+                return
+            }
+        }
+
+        if (hostContactsCache.isEmpty()) {
+            Toast.makeText(this, tr("No Host contacts available.", "لا توجد جهات اتصال متاحة."), Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val items = hostContactsCache.map { "${it.first} (${it.second})" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle(tr("☁️ Select Synced Host Contact (${items.size})", "☁️ اختر من جهات اتصال المضيف (${items.size})"))
+            .setItems(items) { _, which ->
+                val chosen = hostContactsCache[which]
+                if (::etTargetSmsUssdNumber.isInitialized) {
+                    etTargetSmsUssdNumber.setText(chosen.second)
+                }
+                if (::etDialNumber.isInitialized) {
+                    etDialNumber.setText(chosen.second)
+                }
+            }
+            .setNegativeButton(tr("Close", "إغلاق"), null)
+            .show()
+    }
+
+    // ========================================================================
+    // MANDATORY FIX #4: 3-STAGE SPEAKERPHONE ENFORCER ON ANSWER_CALL
+    // ========================================================================
+    @SuppressLint("MissingPermission")
+    private fun answerIncomingCallAndForceSpeaker() {
+        try {
+            val telecomManager = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ANSWER_PHONE_CALLS) == PackageManager.PERMISSION_GRANTED) {
+                telecomManager.acceptRingingCall()
+            }
+        } catch (_: Exception) {
+        }
+
+        // 3-Stage Delay Loop (500ms, 1200ms, 2000ms) with Legacy + Modern AudioDeviceInfo API
+        val delays = longArrayOf(500L, 1200L, 2000L)
+        for (delayMs in delays) {
+            mainScope.launch {
+                delay(delayMs)
+                forceHardwareSpeakerMaxVolume()
+            }
+        }
+        appendVaultEntry("🔊 Executed ANSWER_CALL with 3-Stage Speakerphone Enforcer (0.5s, 1.2s, 2.0s)")
+    }
+
+    @Suppress("DEPRECATION")
+    private fun forceHardwareSpeakerMaxVolume() {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.mode = AudioManager.MODE_IN_CALL
+
+            val maxVoiceVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+            audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, maxVoiceVol, 0)
+
+            // Stage A: Legacy Speakerphone Flag
+            audioManager.isSpeakerphoneOn = true
+
+            // Stage B: Modern Android 12+ Communication Device Routing
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val speakerDevice = audioManager.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                }
+                if (speakerDevice != null) {
+                    audioManager.setCommunicationDevice(speakerDevice)
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    // ========================================================================
+    // HOST HARDWARE EXECUTORS (DIAL, SMS, USSD)
+    // ========================================================================
+    @SuppressLint("MissingPermission")
+    private fun executeHostDial(phoneNumber: String) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
+            val callIntent = Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(phoneNumber)}"))
+            callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(callIntent)
+            // Also engage speakerphone stages for outgoing call
+            mainScope.launch {
+                delay(1500L)
+                forceHardwareSpeakerMaxVolume()
+            }
+            transmitPacket("SMS_STATUS", "Host dialing $phoneNumber with speakerphone engaged.")
+        }
+    }
+
+    private fun executeHostSendSms(target: String, body: String) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
+            transmitPacket("SMS_STATUS", "Error: SEND_SMS permission missing on Host.")
+            return
+        }
+        try {
+            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                getSystemService(SmsManager::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                SmsManager.getDefault()
+            }
+            val parts = smsManager.divideMessage(body)
+            smsManager.sendMultipartTextMessage(target, null, parts, null, null)
+            val msg = "✅ SMS Dispatched by Host to $target: \"$body\""
+            if (::tvSmsUssdResultBox.isInitialized) tvSmsUssdResultBox.text = msg
+            appendVaultEntry(msg)
+            transmitPacket("SMS_STATUS", msg)
+        } catch (e: Exception) {
+            val err = "❌ SMS Failed on Host: ${e.localizedMessage}"
+            if (::tvSmsUssdResultBox.isInitialized) tvSmsUssdResultBox.text = err
+            transmitPacket("SMS_STATUS", err)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun executeHostUssd(ussdCode: String) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            transmitPacket("USSD_RESULT", "Error: CALL_PHONE permission missing on Host.")
+            return
+        }
+        try {
+            val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+            tm.sendUssdRequest(ussdCode, object : TelephonyManager.UssdResponseCallback() {
+                override fun onReceiveUssdResponse(telephonyManager: TelephonyManager?, request: String?, response: CharSequence?) {
+                    val res = "📟 USSD [$request] Response:\n$response"
+                    if (::tvSmsUssdResultBox.isInitialized) tvSmsUssdResultBox.text = res
+                    appendVaultEntry(res)
+                    transmitPacket("USSD_RESULT", res)
+                }
+
+                override fun onReceiveUssdResponseFailed(telephonyManager: TelephonyManager?, request: String?, failureCode: Int) {
+                    val err = "⚠️ USSD [$request] Failed (Code $failureCode)"
+                    if (::tvSmsUssdResultBox.isInitialized) tvSmsUssdResultBox.text = err
+                    transmitPacket("USSD_RESULT", err)
+                }
+            }, Handler(Looper.getMainLooper()))
+        } catch (e: Exception) {
+            transmitPacket("USSD_RESULT", "USSD Error: ${e.localizedMessage}")
+        }
+    }
+
+    // ========================================================================
+    // NETWORK BRIDGES: NTFY.SH CLOUD STREAM + MULTI-DEVICE LOCAL TCP
+    // ========================================================================
+    private fun startCloudBridge() {
+        val topic = etRoomTopic.text.toString().trim().ifEmpty { "simhub_v6_ultra" }
+        val pin = etSecretPin.text.toString().trim()
+        prefs.edit().putString("topic", topic).putString("pin", pin).apply()
+
+        updateLedIndicator(LedState.CONNECTING)
+        logToConsole(tr("Connecting to Ntfy Cloud Stream [$topic]...", "جاري الاتصال بالسحابة [$topic]..."))
+
+        ntfyEventSourceCall?.cancel()
+        val request = Request.Builder()
+            .url("https://ntfy.sh/$topic/json")
+            .build()
+
+        ntfyEventSourceCall = okHttpClient.newCall(request)
+        mainScope.launch(Dispatchers.IO) {
+            try {
+                ntfyEventSourceCall?.execute()?.use { response ->
+                    if (!response.isSuccessful) {
+                        withContext(Dispatchers.Main) {
+                            updateLedIndicator(LedState.DISCONNECTED)
+                            logToConsole("Cloud HTTP Error: ${response.code}")
+                        }
+                        return@use
+                    }
+                    withContext(Dispatchers.Main) {
+                        updateLedIndicator(LedState.CONNECTED)
+                        logToConsole(tr("☁️ Cloud Stream Connected on topic: $topic", "☁️ تم الاتصال بالسحابة بنجاح: $topic"))
+                        transmitPacket("HANDSHAKE", "ONLINE_${currentRole.name}")
+                    }
+                    val reader = BufferedReader(InputStreamReader(response.body!!.byteStream()))
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        val rawLine = line ?: continue
+                        val json = JSONObject(rawLine)
+                        if (json.optString("event") == "message") {
+                            val encryptedMessage = json.optString("message", "")
+                            if (encryptedMessage.isNotEmpty()) {
+                                withContext(Dispatchers.Main) {
+                                    handleIncomingRawFrame(encryptedMessage)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    updateLedIndicator(LedState.DISCONNECTED)
+                    logToConsole("Cloud stream closed: ${e.localizedMessage}")
+                }
+            }
+        }
+    }
+
+    private fun startLocalTcpBridge() {
+        val hostIp = etHostIpInput.text.toString().trim()
+        val pin = etSecretPin.text.toString().trim()
+        prefs.edit().putString("host_ip", hostIp).putString("pin", pin).apply()
+        updateLedIndicator(LedState.CONNECTING)
+
+        if (currentRole == Role.HOST) {
+            mainScope.launch(Dispatchers.IO) {
+                try {
+                    tcpServerSocket?.close()
+                    tcpServerSocket = ServerSocket(8989)
+                    withContext(Dispatchers.Main) {
+                        updateLedIndicator(LedState.CONNECTED)
+                        logToConsole("📡 Host Multi-Client TCP Server listening on ${getLocalIpAddress()}:8989")
+                    }
+                    while (tcpServerSocket?.isClosed == false) {
+                        val client = tcpServerSocket!!.accept()
+                        val writer = PrintWriter(client.getOutputStream(), true)
+                        connectedClientWriters.add(writer)
+                        withContext(Dispatchers.Main) {
+                            logToConsole("📱 Remote Client Connected: ${client.inetAddress.hostAddress} (Total: ${connectedClientWriters.size})")
+                        }
+                        launchClientReader(client, writer)
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        logToConsole("TCP Host stopped: ${e.localizedMessage}")
+                    }
+                }
+            }
+        } else {
+            mainScope.launch(Dispatchers.IO) {
+                try {
+                    remoteSocket?.close()
+                    val socket = Socket(hostIp, 8989)
+                    remoteSocket = socket
+                    val writer = PrintWriter(socket.getOutputStream(), true)
+                    remoteWriter = writer
+                    withContext(Dispatchers.Main) {
+                        updateLedIndicator(LedState.CONNECTED)
+                        logToConsole("📶 Connected to Host TCP Server at $hostIp:8989")
+                        transmitPacket("HANDSHAKE", "REMOTE_JOINED")
+                    }
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        val frame = line ?: continue
+                        withContext(Dispatchers.Main) {
+                            handleIncomingRawFrame(frame)
+                        }
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        updateLedIndicator(LedState.DISCONNECTED)
+                        logToConsole("TCP Remote Connection Failed: ${e.localizedMessage}")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun launchClientReader(client: Socket, writer: PrintWriter) {
+        mainScope.launch(Dispatchers.IO) {
+            try {
+                val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                var line: String?
+                while (reader.readLine().also { line = it } != null) {
+                    val frame = line ?: continue
+                    withContext(Dispatchers.Main) {
+                        handleIncomingRawFrame(frame)
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                connectedClientWriters.remove(writer)
+            }
+        }
+    }
+
+    private fun stopAllBridges() {
+        ntfyEventSourceCall?.cancel()
+        try { tcpServerSocket?.close() } catch (_: Exception) {}
+        try { remoteSocket?.close() } catch (_: Exception) {}
+        connectedClientWriters.clear()
+        remoteWriter = null
+        updateLedIndicator(LedState.DISCONNECTED)
+        logToConsole(tr("🛑 All Cloud & Local bridges stopped.", "🛑 تم إيقاف جميع الجسور."))
+    }
+
+    private fun sendRemoteCommand(type: String, payload: String) {
+        transmitPacket(type, payload)
+    }
+
+    private fun transmitPacket(type: String, payload: String) {
+        val pin = if (::etSecretPin.isInitialized) etSecretPin.text.toString().trim() else ""
+        val topic = if (::etRoomTopic.isInitialized) etRoomTopic.text.toString().trim().ifEmpty { "simhub_v6_ultra" } else "simhub_v6_ultra"
+
+        val packetJson = JSONObject().apply {
+            put("senderId", deviceId)
+            put("role", currentRole.name)
+            put("type", type)
+            put("payload", payload)
+            put("ts", System.currentTimeMillis())
+        }.toString()
+
+        val encryptedFrame = CryptoEngine.encrypt(packetJson, pin)
+
+        mainScope.launch(Dispatchers.IO) {
+            // 1. Broadcast over Local TCP Sockets
+            if (currentRole == Role.HOST) {
+                for (w in connectedClientWriters) {
+                    try { w.println(encryptedFrame) } catch (_: Exception) {}
+                }
+            } else {
+                try { remoteWriter?.println(encryptedFrame) } catch (_: Exception) {}
+            }
+
+            // 2. Broadcast over Ntfy.sh Cloud Stream if active
+            if (ntfyEventSourceCall != null) {
+                try {
+                    val req = Request.Builder()
+                        .url("https://ntfy.sh/$topic")
+                        .post(encryptedFrame.toRequestBody("text/plain; charset=utf-8".toMediaType()))
+                        .build()
+                    okHttpClient.newCall(req).execute().close()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // PACKET ROUTER & PROTOCOL DISPATCHER
+    // ========================================================================
+    private fun handleIncomingRawFrame(rawFrame: String) {
+        val pin = if (::etSecretPin.isInitialized) etSecretPin.text.toString().trim() else ""
+        val decrypted = CryptoEngine.decrypt(rawFrame, pin)
+        if (decrypted.isBlank()) return
+
+        try {
+            val json = JSONObject(decrypted)
+            if (json.optString("senderId") == deviceId) return // Ignore self-echo
+
+            val type = json.optString("type")
+            val payload = json.optString("payload")
+
+            updateLedIndicator(LedState.CONNECTED)
+
+            when (type) {
+                // ---- HOST-SIDE COMMAND HANDLERS ----
+                "SYNC_CALL_LOG" -> {
+                    if (currentRole == Role.HOST) {
+                        val hostLogs = readLastCalls()
+                        transmitPacket("CALL_LOG_DATA", hostLogs)
+                        logToConsole("📤 Sent Host Call Logs (CALL_LOG_DATA) to Remote.")
+                    }
+                }
+                "SYNC_CONTACTS" -> {
+                    if (currentRole == Role.HOST) {
+                        val contactsPayload = readHostContactsPayload()
+                        transmitPacket("CONTACTS_DATA", contactsPayload)
+                        logToConsole("📤 Sent Host Contacts (CONTACTS_DATA) to Remote.")
+                    }
+                }
+                "DIAL_CALL" -> {
+                    if (currentRole == Role.HOST) executeHostDial(payload)
+                }
+                "ANSWER_CALL" -> {
+                    if (currentRole == Role.HOST) answerIncomingCallAndForceSpeaker()
+                }
+                "SEND_SMS" -> {
+                    if (currentRole == Role.HOST) {
+                        val parts = payload.split("|", limit = 2)
+                        if (parts.size == 2) executeHostSendSms(parts[0], parts[1])
+                    }
+                }
+                "RUN_USSD" -> {
+                    if (currentRole == Role.HOST) executeHostUssd(payload)
+                }
+
+                // ---- REMOTE-SIDE DATA RECEIVERS ----
+                "CALL_LOG_DATA" -> {
+                    if (::tvCallLogsBox.isInitialized) tvCallLogsBox.text = payload
+                    appendVaultEntry("📋 Synced Host Call Logs:\n$payload")
+                }
+                "CONTACTS_DATA" -> {
+                    parseAndCacheHostContacts(payload)
+                    Toast.makeText(
+                        this,
+                        tr("☁️ Synced ${hostContactsCache.size} Host Contacts!", "☁️ تمت مزامنة ${hostContactsCache.size} جهة اتصال من المضيف!"),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+                "INCOMING_CALL" -> {
+                    showIncomingCallOverlay(payload)
+                    appendVaultEntry("📲 Incoming Call on Host from: $payload")
+                }
+                "CALL_ENDED" -> {
+                    hideIncomingCallOverlay()
+                }
+                "INCOMING_SMS", "SMS_STATUS", "USSD_RESULT" -> {
+                    if (::tvSmsUssdResultBox.isInitialized) tvSmsUssdResultBox.text = payload
+                    appendVaultEntry(payload)
+                }
+                "APP_NOTIFICATION" -> {
+                    notificationsVaultList.add(0, payload)
+                    refreshNotificationsUI()
+                    appendVaultEntry(payload)
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    // ========================================================================
+    // FLOATING INCOMING CALL OVERLAY (REMOTE ALERT + SPEAKER ANSWER)
+    // ========================================================================
+    private fun showIncomingCallOverlay(callerNumber: String) {
+        tvIncomingCallerId.text = tr("📲 Host Ringing: $callerNumber", "📲 مكالمة واردة للمضيف: $callerNumber")
+        inAppCallBanner.visibility = View.VISIBLE
+
+        if (Settings.canDrawOverlays(this) && floatingOverlayView == null) {
+            try {
+                val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                val banner = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(16), dp(14), dp(16), dp(14))
+                    background = GradientDrawable().apply {
+                        cornerRadius = dp(16).toFloat()
+                        setColor(Color.parseColor("#B91C1C"))
+                        setStroke(dp(2), Color.WHITE)
+                    }
+                }
+                val label = TextView(this).apply {
+                    text = tr("📲 Host Call: $callerNumber", "📲 اتصال بالمضيف: $callerNumber")
+                    setTextColor(Color.WHITE)
+                    textSize = 14f
+                    typeface = Typeface.DEFAULT_BOLD
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                val answerBtn = create3DButton("🔊 Answer", "🔊 رد", Color.parseColor("#15803D"), 12f) {
+                    sendRemoteCommand("ANSWER_CALL", "FORCE_SPEAKER")
+                    hideIncomingCallOverlay()
+                }
+                banner.addView(label)
+                banner.addView(answerBtn)
+
+                val params = WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = Gravity.TOP
+                    y = dp(40)
+                }
+                wm.addView(banner, params)
+                floatingOverlayView = banner
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun hideIncomingCallOverlay() {
+        inAppCallBanner.visibility = View.GONE
+        floatingOverlayView?.let {
+            try {
+                val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                wm.removeView(it)
+            } catch (_: Exception) {
+            }
+            floatingOverlayView = null
+        }
+    }
+
+    // ========================================================================
+    // VAULT PERSISTENCE & HELPERS
+    // ========================================================================
+    private fun appendVaultEntry(entry: String) {
+        val stamp = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+        historyVaultList.add(0, "[$stamp] $entry")
+        if (historyVaultList.size > 200) {
+            historyVaultList.removeAt(historyVaultList.lastIndex)
+        }
+        savePersistedVaults()
+        refreshHistoryVaultUI()
+    }
+
+    private fun refreshNotificationsUI() {
+        if (!::tvNotificationsBox.isInitialized) return
+        tvNotificationsBox.text = if (notificationsVaultList.isEmpty()) {
+            tr("No remote app notifications captured yet.", "لا توجد إشعارات تطبيقات مسجلة بعد.")
+        } else {
+            notificationsVaultList.joinToString("\n─────────────────\n")
+        }
+    }
+
+    private fun refreshHistoryVaultUI() {
+        if (!::tvHistoryVaultBox.isInitialized) return
+        tvHistoryVaultBox.text = if (historyVaultList.isEmpty()) {
+            tr("History Vault is currently empty.", "خزنة السجل فارغة حالياً.")
+        } else {
+            historyVaultList.mapIndexed { idx, item ->
+                val lockBadge = if (idx < 15) "🛡️ [PROTECTED #${idx + 1}] " else ""
+                "$lockBadge$item"
+            }.joinToString("\n═════════════════\n")
+        }
+    }
+
+    private fun savePersistedVaults() {
+        val arr = JSONArray()
+        historyVaultList.forEach { arr.put(it) }
+        prefs.edit().putString("history_vault_json", arr.toString()).apply()
+    }
+
+    private fun loadPersistedVaults() {
+        try {
+            val raw = prefs.getString("history_vault_json", "[]") ?: "[]"
+            val arr = JSONArray(raw)
+            historyVaultList.clear()
+            for (i in 0 until arr.length()) {
+                historyVaultList.add(arr.getString(i))
+            }
+            val contactsRaw = prefs.getString("cached_host_contacts", "") ?: ""
+            if (contactsRaw.isNotEmpty()) parseAndCacheHostContacts(contactsRaw)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun logToConsole(msg: String) {
+        if (::tvConnectionConsole.isInitialized) {
+            val stamp = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+            tvConnectionConsole.text = "[$stamp] $msg\n${tvConnectionConsole.text}"
+        }
+    }
+
+    private fun getLocalIpAddress(): String {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val intf = interfaces.nextElement()
+                val addrs = intf.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        return addr.hostAddress ?: "127.0.0.1"
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return "192.168.43.1"
+    }
+
+    private fun requestRuntimePermissions() {
+        val permissions = mutableListOf(
+            Manifest.permission.READ_PHONE_STATE,
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.ANSWER_PHONE_CALLS,
+            Manifest.permission.READ_CALL_LOG,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.RECEIVE_SMS,
+            Manifest.permission.READ_SMS
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        ActivityCompat.requestPermissions(this, permissions.toTypedArray(), 600)
+    }
+
+    override fun onDestroy() {
+        hideIncomingCallOverlay()
+        super.onDestroy()
+    }
+}
