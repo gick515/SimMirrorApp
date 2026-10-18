@@ -19,11 +19,15 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Build APK with Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.6'
-          arguments: assembleDebug
+      - name: Build Debug APK
+        run: |
+          echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" > gradle.properties
+          echo "android.useAndroidX=true" >> gradle.properties
+          echo "kotlin.code.style=official" >> gradle.properties
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          curl -sL https://services.gradle.org/distributions/gradle-8.6-bin.zip -o gradle.zip
+          unzip -q -o gradle.zip
+          ./gradle-8.6/bin/gradle assembleDebug --no-daemon
 
       - name: Upload Compiled APK
         uses: actions/upload-artifact@v4
