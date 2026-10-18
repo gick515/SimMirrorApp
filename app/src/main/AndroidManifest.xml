@@ -28,6 +28,8 @@
     <application
         android:allowBackup="true"
         android:label="SIM Mirror Hub v6.0"
+        android:icon="@android:drawable/stat_sys_data_bluetooth"
+        android:roundIcon="@android:drawable/stat_sys_data_bluetooth"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.AppCompat.NoActionBar"
@@ -52,7 +54,7 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- Dedicated App Notification Listener (WhatsApp, Telegram, Banks) -->
+        <!-- Dedicated App Notification Listener -->
         <service
             android:name=".MirrorNotificationService"
             android:exported="true"
@@ -63,7 +65,7 @@
             </intent-filter>
         </service>
 
-        <!-- Hardware Broadcast Receiver for Incoming SMS & Calls on Host -->
+        <!-- Hardware Broadcast Receiver for Incoming SMS & Calls -->
         <receiver
             android:name=".SimHardwareReceiver"
             android:exported="true">
