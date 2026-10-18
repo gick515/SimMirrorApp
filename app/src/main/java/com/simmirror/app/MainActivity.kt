@@ -87,6 +87,7 @@ class MainActivity : AppCompatActivity() {
     private var activeRingtone: Ringtone? = null
     private var selectedSimSlot = 0
     private var lastCallerNumber = ""
+    private var isCloudConnected = false
 
     // عناصر الواجهة
     private lateinit var topStatusBanner: TextView
@@ -442,6 +443,571 @@ class MainActivity : AppCompatActivity() {
                 socket.send(broadcastPacket)
 
                 val buf = ByteArray(256)
+                val response = DatagramPacket(buf, buf.size)
+                socket.receive(response)
+                val reply = String(response.data, 0, response.length)
+                socket.close()
+
+                if (reply.startsWith("SIM_HOST_HERE:")) {
+                    val foundIp = reply.substringAfter("SIM_HOST_HERE:")
+                    withContext(Dispatchers.Main) {
+                        ipInput.setText(foundIp)
+                        appendLog("🎯 تم اكتشاف الهاتف الأساسي تلقائياً على: $foundIp")
+                        connectToHostTcp(foundIp)
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    appendLog("⚠️ لم يتم العثور تلقائياً؛ يمكنك كتابة الـ IP يدوياً أو استخدام الربط السحابي.")
+                }
+            }
+        }
+    }
+
+    private fun connectToHostTcp(hostIp: String) {
+        if (hostIp.isEmpty()) {
+            appendLog("أدخل الـ IP أولاً")
+            return
+        }
+        MirrorBridge.isHostMode = false
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                clientSocket?.close()
+                val socket = Socket(hostIp, 8989)
+                clientSocket = socket
+                withContext(Dispatchers.Main) {
+                    topStatusBanner.text = "🟣 متصل محلياً بالأساسي ($hostIp)"
+                    appendLog("✅ تم الاتصال بالهاتف الأساسي عبر Wi-Fi / Hotspot!")
+                }
+                listenToTcpSocket(socket)
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { appendLog("❌ فشل الاتصال المحلي: ${e.message}") }
+            }
+        }
+    }
+
+    private suspend fun listenToTcpSocket(socket: Socket) {
+        val writer = PrintWriter(socket.getOutputStream(), true)
+        MirrorBridge.attachTcpWriter(writer)
+        val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+        try {
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                line?.let { payload ->
+                    val json = JSONObject(payload)
+                    withContext(Dispatchers.Main) { handleIncomingJson(json) }
+                }
+            }
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) { appendLog("انقطع الاتصال المحلي.") }
+        }
+    }
+
+    // ================= 2. الربط السحابي الثابت مع إعادة الاتصال التلقائي (Auto-Reconnect) =================
+    private fun connectCloudBridge() {
+        val client = OkHttpClient.Builder()
+            .pingInterval(10, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .build()
+
+        val roomEncoded = Uri.encode(MirrorBridge.secretRoomCode)
+        val request = Request.Builder()
+            .url("wss://free.blr2.piesocket.com/v3/$roomEncoded?api_key=VCXCEuvhGcBDP7XhiJJUDvR1e1D3eiVjgZ9VRiaV&notify_self=0")
+            .build()
+
+        appendLog("☁️ جاري الاتصال بالسحابة الثابتة على الغرفة [${MirrorBridge.secretRoomCode}]...")
+
+        client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                MirrorBridge.attachCloudSocket(webSocket)
+                isCloudConnected = true
+                scope.launch {
+                    topStatusBanner.text = "☁️ متصل سحابياً بثبات | الغرفة: ${MirrorBridge.secretRoomCode}"
+                    appendLog("✅ تم الربط السحابي بنجاح وثبات تام!")
+                    if (MirrorBridge.isHostMode) sendBatteryStatusToClient()
+                }
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val json = JSONObject(text)
+                    if (json.optString("room") == MirrorBridge.secretRoomCode) {
+                        val myRole = if (MirrorBridge.isHostMode) "HOST" else "CLIENT"
+                        if (json.optString("senderRole") != myRole) {
+                            scope.launch { handleIncomingJson(json) }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                isCloudConnected = false
+                scope.launch { 
+                    appendLog("⚠️ انقطع الاتصال السحابي، جاري إعادة المحاولة خلال 5 ثوانٍ...")
+                }
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (!isCloudConnected) connectCloudBridge()
+                }, 5000)
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                isCloudConnected = false
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (!isCloudConnected) connectCloudBridge()
+                }, 5000)
+            }
+        })
+    }
+
+    // ================= 3. معالجة الأوامر والمميزات الـ 6 =================
+    private fun triggerAction(type: String, number: String, body: String = "") {
+        if (MirrorBridge.isHostMode) {
+            executeHostHardwareCommand(type, number, body)
+        } else {
+            MirrorBridge.sendPacket(type, number, body)
+            appendLog("🚀 تم إرسال الأمر ($type) للهاتف الأساسي...")
+        }
+    }
+
+    private fun handleIncomingJson(json: JSONObject) {
+        val type = json.optString("type")
+        val number = json.optString("number")
+        val body = json.optString("body")
+        val extra = json.optString("extra")
+
+        when (type) {
+            "INCOMING_SMS" -> {
+                appendLog("📩 رسالة واردة من [$extra ($number)]:\n$body")
+                showPopUpNotification("رسالة جديدة من $extra", body)
+                checkAndAutoCopyOtp(body)
+            }
+            "INCOMING_CALL" -> {
+                lastCallerNumber = number
+                targetNumberInput.setText(number)
+                appendLog("📞 يتصل الآن: $extra ($number)")
+                showPopUpNotification("📞 مكالمة واردة على الأساسي", "المتصل: $extra ($number)")
+                startRingingAlert()
+            }
+            "BATTERY_STATUS" -> {
+                batteryBanner.text = "🔋 بطارية الأساسي: $number% ($body) | الشريحة: SIM ${selectedSimSlot + 1}"
+                if (extra == "LOW") {
+                    showPopUpNotification("⚠️ بطارية الهاتف الأساسي منخفضة!", "وصلت البطارية إلى $number%، يرجى توصيله بالشاحن.")
+                }
+            }
+            "CALL_LOG_DATA" -> {
+                callHistoryText.text = body
+                appendLog("✅ تم تحديث سجل المكالمات من الهاتف الأساسي.")
+            }
+            "SMS_INBOX_DATA" -> {
+                smsInboxText.text = body
+                appendLog("✅ تم تحديث صندوق الرسائل من الهاتف الأساسي.")
+            }
+            "SELECT_SIM" -> {
+                selectedSimSlot = number.toIntOrNull() ?: 0
+                appendLog("تم التبديل إلى الشريحة SIM ${selectedSimSlot + 1}")
+            }
+            "SEND_SMS", "MAKE_CALL", "ANSWER_CALL", "END_CALL", "REJECT_WITH_SMS", "SYNC_CALL_LOG", "SYNC_SMS_INBOX" -> {
+                executeHostHardwareCommand(type, number, body)
+            }
+        }
+    }
+
+    // النسخ التلقائي لأكواد الـ OTP في الحافظة
+    private fun checkAndAutoCopyOtp(messageBody: String) {
+        val pattern = Pattern.compile("\\b(\\d{4,8})\\b")
+        val matcher = pattern.matcher(messageBody)
+        if (matcher.find()) {
+            val otpCode = matcher.group(1) ?: return
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("OTP Code", otpCode))
+            otpBanner.text = "🔐 تم نسخ كود التفعيل تلقائياً: $otpCode (جاهز للصق!)"
+            Toast.makeText(this, "تم نسخ الكود تلقائياً: $otpCode", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun executeHostHardwareCommand(type: String, number: String, body: String) {
+        try {
+            when (type) {
+                "SEND_SMS" -> {
+                    val smsManager = getSmsManagerForSlot(selectedSimSlot)
+                    smsManager.sendTextMessage(number, null, body, null, null)
+                    appendLog("✅ تم إرسال SMS من SIM ${selectedSimSlot + 1} إلى $number")
+                }
+                "MAKE_CALL" -> {
+                    val encoded = Uri.encode(number)
+                    val callIntent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$encoded")).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    startActivity(callIntent)
+                    appendLog("⏳ جاري الاتصال بـ $number...")
+                }
+                "ANSWER_CALL" -> {
+                    val tm = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) tm.acceptRingingCall()
+                    val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    am.mode = AudioManager.MODE_IN_CALL
+                    am.isSpeakerphoneOn = true
+                    appendLog("🔊 تم الرد وفتح السبيكر")
+                }
+                "END_CALL" -> {
+                    val tm = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) tm.endCall()
+                    appendLog("⛔ تم إنهاء/رفض المكالمة")
+                }
+                "REJECT_WITH_SMS" -> {
+                    val tm = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) tm.endCall()
+                    if (number.isNotEmpty()) {
+                        getSmsManagerForSlot(selectedSimSlot).sendTextMessage(number, null, body, null, null)
+                        appendLog("💬 تم رفض المكالمة وإرسال رسالة انشغال إلى $number")
+                    }
+                }
+                "SYNC_CALL_LOG" -> {
+                    val logs = readLastCalls()
+                    if (MirrorBridge.isHostMode) callHistoryText.text = logs
+                    MirrorBridge.sendPacket("CALL_LOG_DATA", "", logs)
+                }
+                "SYNC_SMS_INBOX" -> {
+                    val smsList = readLastSms()
+                    if (MirrorBridge.isHostMode) smsInboxText.text = smsList
+                    MirrorBridge.sendPacket("SMS_INBOX_DATA", "", smsList)
+                }
+            }
+        } catch (e: Exception) {
+            appendLog("⚠️ خطأ تنفيذي: ${e.message}")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun getSmsManagerForSlot(slotIndex: Int): SmsManager {
+        return try {
+            val subManager = getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
+            val subs = subManager.activeSubscriptionInfoList
+            val subId = if (subs != null && subs.size > slotIndex) subs[slotIndex].subscriptionId else SubscriptionManager.getDefaultSmsSubscriptionId()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                getSystemService(SmsManager::class.java).createForSubscriptionId(subId)
+            } else {
+                @Suppress("DEPRECATION")
+                SmsManager.getSmsManagerForSubscriptionId(subId)
+            }
+        } catch (e: Exception) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) getSystemService(SmsManager::class.java)
+            else @Suppress("DEPRECATION") SmsManager.getDefault()
+        }
+    }
+
+    // قراءة اسم المتصل من جهات الاتصال
+    fun lookupContactName(phoneNumber: String): String {
+        if (phoneNumber.isEmpty()) return "غير معروف"
+        return try {
+            val uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(phoneNumber))
+            val cursor = contentResolver.query(uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)
+            var name = phoneNumber
+            cursor?.use {
+                if (it.moveToFirst()) name = it.getString(0)
+            }
+            name
+        } catch (e: Exception) {
+            phoneNumber
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun readLastCalls(): String {
+        val sb = StringBuilder()
+        try {
+            val cursor = contentResolver.query(
+                CallLog.Calls.CONTENT_URI,
+                null, null, null,
+                "${CallLog.Calls.DATE} DESC"
+            )
+            var count = 0
+            val sdf = SimpleDateFormat("dd/MM HH:mm", Locale.getDefault())
+            cursor?.use {
+                val numIdx = it.getColumnIndex(CallLog.Calls.NUMBER)
+                val typeIdx = it.getColumnIndex(CallLog.Calls.TYPE)
+                val dateIdx = it.getColumnIndex(CallLog.Calls.DATE)
+                while (it.moveToNext() && count < 15) {
+                    val num = it.getString(numIdx) ?: ""
+                    val name = lookupContactName(num)
+                    val type = when (it.getInt(typeIdx)) {
+                        CallLog.Calls.INCOMING_TYPE -> "📥 واردة"
+                        CallLog.Calls.OUTGOING_TYPE -> "📤 صادرة"
+                        CallLog.Calls.MISSED_TYPE -> "❌ فائتة"
+                        else -> "📞"
+                    }
+                    val dateStr = sdf.format(Date(it.getLong(dateIdx)))
+                    sb.append("$type | $name ($num) - $dateStr\n")
+                    count++
+                }
+            }
+        } catch (e: Exception) {
+            return "تعذر قراءة السجل: تأكد من منح صلاحية Call Logs"
+        }
+        return if (sb.isEmpty()) "لا توجد مكالمات مسجلة." else sb.toString()
+    }
+
+    private fun readLastSms(): String {
+        val sb = StringBuilder()
+        try {
+            val cursor = contentResolver.query(
+                Telephony.Sms.Inbox.CONTENT_URI,
+                arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE),
+                null, null,
+                "${Telephony.Sms.DATE} DESC"
+            )
+            var count = 0
+            val sdf = SimpleDateFormat("dd/MM HH:mm", Locale.getDefault())
+            cursor?.use {
+                while (it.moveToNext() && count < 15) {
+                    val addr = it.getString(0) ?: ""
+                    val body = it.getString(1) ?: ""
+                    val dateStr = sdf.format(Date(it.getLong(2)))
+                    val name = lookupContactName(addr)
+                    sb.append("📩 [$name - $dateStr]:\n$body\n──────────────\n")
+                    count++
+                }
+            }
+        } catch (e: Exception) {
+            return "تعذر قراءة الرسائل: تأكد من منح صلاحية SMS"
+        }
+        return if (sb.isEmpty()) "صندوق الوارد فارغ." else sb.toString()
+    }
+
+    // رنين واهتزاز الهاتف الفرعي عند ورود مكالمة
+    private fun startRingingAlert() {
+        try {
+            stopRingingAlert()
+            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+            activeRingtone = RingtoneManager.getRingtone(applicationContext, uri)
+            activeRingtone?.play()
+            val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createOneShot(2000, VibrationEffect.DEFAULT_AMPLITUDE))
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun stopRingingAlert() {
+        try {
+            activeRingtone?.stop()
+        } catch (_: Exception) {}
+    }
+
+    private fun enableBluetoothAudioRouting() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.mode = AudioManager.MODE_IN_COMMUNICATION
+            am.startBluetoothSco()
+            am.isBluetoothScoOn = true
+            appendLog("🎧 تم توجيه الصوت عبر البلوتوث (HFP).")
+        } catch (e: Exception) {
+            startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+        }
+    }
+
+    private fun registerCallAndBatteryMonitors() {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    TelephonyManager.ACTION_PHONE_STATE_CHANGED -> {
+                        val state = intent.getStringExtra(TelephonyManager.EXTRA_STATE)
+                        val incomingNumber = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER) ?: ""
+                        if (state == TelephonyManager.EXTRA_STATE_RINGING && MirrorBridge.isHostMode) {
+                            val callerName = lookupContactName(incomingNumber)
+                            appendLog("📞 يرن الآن: $callerName ($incomingNumber)")
+                            MirrorBridge.sendPacket("INCOMING_CALL", incomingNumber, "", callerName)
+                        }
+                    }
+                    Intent.ACTION_BATTERY_CHANGED -> {
+                        if (MirrorBridge.isHostMode) sendBatteryStatusToClient()
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+        }
+        registerReceiver(receiver, filter)
+    }
+
+    private fun sendBatteryStatusToClient() {
+        val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        val pct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        val charging = if (bm.isCharging) "متصل بالشاحن ⚡" else "غير متصل بالشاحن"
+        val lowAlert = if (pct <= 15 && !bm.isCharging) "LOW" else "OK"
+        batteryBanner.text = "🔋 بطارية هذا الجهاز: $pct% ($charging)"
+        MirrorBridge.sendPacket("BATTERY_STATUS", pct.toString(), charging, lowAlert)
+    }
+
+    private fun setupBridgeListeners() {
+        MirrorBridge.onUiUpdate = { json ->
+            scope.launch { handleIncomingJson(json) }
+        }
+        MirrorBridge.onLogEvent = { msg ->
+            scope.launch { appendLog(msg) }
+        }
+    }
+
+    private fun startForegroundKeepAlive() {
+        try {
+            val serviceIntent = Intent(this, MirrorBackgroundService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel("SIM_MIRROR_ALERTS", "تنبيهات المكالمات والرسائل", NotificationManager.IMPORTANCE_HIGH)
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(ch)
+        }
+    }
+
+    private fun showPopUpNotification(title: String, message: String) {
+        try {
+            val pendingIntent = PendingIntent.getActivity(
+                this, 0, Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notif = NotificationCompat.Builder(this, "SIM_MIRROR_ALERTS")
+                .setSmallIcon(android.R.drawable.sym_action_call)
+                .setContentTitle(title)
+                .setContentText(message)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .setContentIntent(pendingIntent)
+                .build()
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(System.currentTimeMillis().toInt(), notif)
+        } catch (_: Exception) {}
+    }
+
+    private fun getLocalIpAddress(): String {
+        return try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            val ip = Formatter.formatIpAddress(wm.connectionInfo.ipAddress)
+            if (ip == "0.0.0.0") "192.168.43.1" else ip
+        } catch (e: Exception) {
+            "192.168.43.1"
+        }
+    }
+
+    private fun appendLog(message: String) {
+        val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        logText.text = "[$time] $message\n${logText.text}"
+    }
+
+    private fun createSectionHeader(title: String): TextView {
+        return TextView(this).apply {
+            text = title
+            textSize = 15f
+            setTextColor(Color.parseColor("#38BDF8"))
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 30, 0, 12)
+        }
+    }
+
+    private fun createStyledInput(hintText: String): EditText {
+        return EditText(this).apply {
+            hint = hintText
+            setHintTextColor(Color.parseColor("#64748B"))
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#1E293B"))
+            setPadding(25, 22, 25, 22)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 10; bottomMargin = 10 }
+        }
+    }
+
+    private fun createStyledButton(label: String, hexColor: String, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor(hexColor))
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun requestNecessaryPermissions() {
+        val perms = mutableListOf(
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.RECEIVE_SMS,
+            Manifest.permission.READ_SMS,
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.READ_PHONE_STATE,
+            Manifest.permission.READ_CALL_LOG,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.ANSWER_PHONE_CALLS
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            perms.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        ActivityCompat.requestPermissions(this, perms.toTypedArray(), 102)
+    }
+}
+
+class MirrorBackgroundService : Service() {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val channelId = "SIM_MIRROR_BG"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(channelId, "خدمة المزامنة بالخلفية", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+        }
+        val notif = NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(android.R.drawable.sym_action_call)
+            .setContentTitle("SIM Mirror Pro يعمل في الخلفية")
+            .setContentText("متصل وجاهز لتحويل المكالمات والرسائل وأكواد الـ OTP")
+            .setOngoing(true)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(1, notif)
+        }
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+class SmsBroadcastReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Telephony.Sms.Intents.SMS_RECEIVED_ACTION) {
+            val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
+            for (sms in messages) {
+                val sender = sms.originatingAddress ?: "Unknown"
+                val body = sms.messageBody ?: ""
+                val contactName = try {
+                    val uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(sender))
+                    var name = sender
+                    context.contentResolver.query(uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)?.use {
+                        if (it.moveToFirst()) name = it.getString(0)
+                    }
+                    name
+                } catch (_: Exception) { sender }
+
+                MirrorBridge.onLogEvent?.invoke("📩 رسالة جديدة من $contactName ($sender): $body")
+                MirrorBridge.sendPacket("INCOMING_SMS", sender, body, contactName)
+            }
+        }
+    }
+}
+        val buf = ByteArray(256)
                 val response = DatagramPacket(buf, buf.size)
                 socket.receive(response)
                 val reply = String(response.data, 0, response.length)
